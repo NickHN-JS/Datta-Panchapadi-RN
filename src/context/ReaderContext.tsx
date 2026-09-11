@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import type { Book } from '../types/book';
 import { libraryBooks } from '../data/library';
@@ -8,8 +8,37 @@ const APP_VERSION: string = require('../../package.json').version;
 export type Theme = 'light' | 'dark' | 'papyrus';
 export type FontFamily = 'serif' | 'sans' | 'slab';
 
-interface ReaderContextType {
-    isReady: boolean;
+function todayStr(): string {
+    return new Date().toLocaleDateString('en-CA');
+}
+
+function yesterdayStr(): string {
+    return new Date(Date.now() - 86400000).toLocaleDateString('en-CA');
+}
+
+/**
+ * Split into four contexts (instead of one big one) so a click that only
+ * matters to one slice of state doesn't re-render everything else. The
+ * previous single-context design meant opening the Drawer, toggling theme,
+ * or tapping the jap counter re-rendered every mounted reading page (every
+ * paragraph/heading/list block), which felt fine on short books and very
+ * sluggish on long ones. Swiping stayed smooth throughout because the
+ * carousel's animation runs on the UI thread, independent of JS-thread
+ * re-render cost — but a button press has no such cushion, so the full
+ * re-render cost was directly felt on every tap.
+ *
+ * - Settings: theme/font — read by content rendering (ChapterView) AND controls.
+ * - Nav: which book/chapter is open — read by content + chrome.
+ * - UI: modal/drawer open flags — read only by chrome and the modals themselves.
+ * - Sadhana: jap counter/streak — changes rapidly during counting, isolated
+ *   so it never touches the reading view.
+ */
+
+// ---------------------------------------------------------------------------
+// Settings (theme, font size, font family)
+// ---------------------------------------------------------------------------
+
+interface ReaderSettingsContextType {
     theme: Theme;
     setTheme: (theme: Theme) => void;
     fontSize: number;
@@ -18,16 +47,49 @@ interface ReaderContextType {
     resetFontSize: () => void;
     fontFamily: FontFamily;
     cycleFontFamily: () => void;
+}
+
+const ReaderSettingsContext = createContext<ReaderSettingsContextType | undefined>(undefined);
+
+export const useReaderSettings = () => {
+    const ctx = useContext(ReaderSettingsContext);
+    if (!ctx) throw new Error('useReaderSettings must be used within a ReaderProvider');
+    return ctx;
+};
+
+// ---------------------------------------------------------------------------
+// Navigation (active book/chapter)
+// ---------------------------------------------------------------------------
+
+interface ReaderNavContextType {
+    isReady: boolean;
     activeChapterId: string;
     setActiveChapterId: (id: string) => void;
     activeBookId: string | null;
     setActiveBookId: (id: string | null) => void;
     activeBook: Book | null;
     books: Book[];
+}
+
+const ReaderNavContext = createContext<ReaderNavContextType | undefined>(undefined);
+
+export const useReaderNav = () => {
+    const ctx = useContext(ReaderNavContext);
+    if (!ctx) throw new Error('useReaderNav must be used within a ReaderProvider');
+    return ctx;
+};
+
+// ---------------------------------------------------------------------------
+// UI (modal/drawer open flags, onboarding tour)
+// ---------------------------------------------------------------------------
+
+interface ReaderUIContextType {
     isSearchOpen: boolean;
     setSearchOpen: (open: boolean) => void;
     isSadhanaOpen: boolean;
     setSadhanaOpen: (open: boolean) => void;
+    sadhanaActiveTab: 'jap' | 'stats';
+    setSadhanaActiveTab: (tab: 'jap' | 'stats') => void;
     isDrawerOpen: boolean;
     setDrawerOpen: (open: boolean) => void;
     isChapterIndexOpen: boolean;
@@ -36,20 +98,37 @@ interface ReaderContextType {
     setTourActive: (active: boolean) => void;
     tourStep: number;
     setTourStep: (step: number) => void;
+}
+
+const ReaderUIContext = createContext<ReaderUIContextType | undefined>(undefined);
+
+export const useReaderUI = () => {
+    const ctx = useContext(ReaderUIContext);
+    if (!ctx) throw new Error('useReaderUI must be used within a ReaderProvider');
+    return ctx;
+};
+
+// ---------------------------------------------------------------------------
+// Sadhana (jap counter / streak)
+// ---------------------------------------------------------------------------
+
+interface SadhanaContextType {
     sadhanaStreak: number;
     sadhanaTodayJap: number;
     recordSadhanaJap: (count: number) => void;
 }
 
-const ReaderContext = createContext<ReaderContextType | undefined>(undefined);
+const SadhanaContext = createContext<SadhanaContextType | undefined>(undefined);
 
-function todayStr(): string {
-    return new Date().toLocaleDateString('en-CA');
-}
+export const useSadhana = () => {
+    const ctx = useContext(SadhanaContext);
+    if (!ctx) throw new Error('useSadhana must be used within a ReaderProvider');
+    return ctx;
+};
 
-function yesterdayStr(): string {
-    return new Date(Date.now() - 86400000).toLocaleDateString('en-CA');
-}
+// ---------------------------------------------------------------------------
+// Provider
+// ---------------------------------------------------------------------------
 
 export const ReaderProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [isReady, setIsReady] = useState(false);
@@ -64,6 +143,7 @@ export const ReaderProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
     const [isSearchOpen, setSearchOpen] = useState<boolean>(false);
     const [isSadhanaOpen, setSadhanaOpen] = useState<boolean>(false);
+    const [sadhanaActiveTab, setSadhanaActiveTab] = useState<'jap' | 'stats'>('jap');
     const [isDrawerOpen, setDrawerOpen] = useState<boolean>(false);
     const [isChapterIndexOpen, setChapterIndexOpen] = useState<boolean>(false);
     const [isTourActive, setTourActiveState] = useState<boolean>(false);
@@ -129,24 +209,26 @@ export const ReaderProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         })();
     }, []);
 
-    const setTourActive = (active: boolean) => {
+    const setTourActive = useCallback((active: boolean) => {
         setTourActiveState(active);
         if (!active) {
             AsyncStorage.setItem(`reader-tour-completed-${APP_VERSION}`, 'true');
         }
-    };
+    }, []);
 
-    const recordSadhanaJap = (count: number) => {
+    const recordSadhanaJap = useCallback((count: number) => {
         if (count <= 0) return;
         const today = todayStr();
 
-        AsyncStorage.getItem('sadhana-last-active-date').then(async (lastDate) => {
-            lastDate = lastDate || '';
+        AsyncStorage.getItem('sadhana-last-active-date').then(async (storedLastDate) => {
+            const lastDate = storedLastDate || '';
 
-            const newTodayJap = sadhanaTodayJap + count;
-            setSadhanaTodayJap(newTodayJap);
-            await AsyncStorage.setItem('sadhana-today-jap', newTodayJap.toString());
-            await AsyncStorage.setItem(`sadhana-jap-${today}`, newTodayJap.toString());
+            setSadhanaTodayJap(prev => {
+                const newTodayJap = prev + count;
+                AsyncStorage.setItem('sadhana-today-jap', newTodayJap.toString());
+                AsyncStorage.setItem(`sadhana-jap-${today}`, newTodayJap.toString());
+                return newTodayJap;
+            });
 
             const totalJapStr = (await AsyncStorage.getItem('sadhana-total-jap')) || '0';
             const newTotalJap = parseInt(totalJapStr, 10) + count;
@@ -154,22 +236,22 @@ export const ReaderProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
             if (lastDate !== today) {
                 const yesterday = yesterdayStr();
-                const newStreak = lastDate === yesterday ? sadhanaStreak + 1 : 1;
-                setSadhanaStreak(newStreak);
-                await AsyncStorage.setItem('sadhana-streak', newStreak.toString());
+                setSadhanaStreak(prev => {
+                    const newStreak = lastDate === yesterday ? prev + 1 : 1;
+                    AsyncStorage.setItem('sadhana-streak', newStreak.toString());
+                    return newStreak;
+                });
                 await AsyncStorage.setItem('sadhana-last-active-date', today);
             }
         });
-    };
+    }, []);
 
-    const activeBook = libraryBooks.find(b => b.id === activeBookId) || null;
-
-    const setActiveChapterId = (id: string) => {
+    const setActiveChapterId = useCallback((id: string) => {
         setActiveChapterIdState(id);
         AsyncStorage.setItem('reader-active-chapter', id);
-    };
+    }, []);
 
-    const setActiveBookId = (id: string | null) => {
+    const setActiveBookId = useCallback((id: string | null) => {
         setActiveBookIdState(id);
         if (id) {
             AsyncStorage.setItem('reader-active-book', id);
@@ -181,36 +263,36 @@ export const ReaderProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             AsyncStorage.removeItem('reader-active-book');
             setActiveChapterId('');
         }
-    };
+    }, [setActiveChapterId]);
 
-    const setTheme = (newTheme: Theme) => {
+    const setTheme = useCallback((newTheme: Theme) => {
         setThemeState(newTheme);
         AsyncStorage.setItem('reader-theme', newTheme);
-    };
+    }, []);
 
-    const increaseFontSize = () => {
+    const increaseFontSize = useCallback(() => {
         setFontSizeState(prev => {
             const newValue = Math.min(prev + 2, 24);
             AsyncStorage.setItem('reader-font-size', newValue.toString());
             return newValue;
         });
-    };
+    }, []);
 
-    const decreaseFontSize = () => {
+    const decreaseFontSize = useCallback(() => {
         setFontSizeState(prev => {
             const newValue = Math.max(prev - 2, 16);
             AsyncStorage.setItem('reader-font-size', newValue.toString());
             return newValue;
         });
-    };
+    }, []);
 
-    const resetFontSize = () => {
+    const resetFontSize = useCallback(() => {
         const resetValue = 16;
         setFontSizeState(resetValue);
         AsyncStorage.setItem('reader-font-size', resetValue.toString());
-    };
+    }, []);
 
-    const cycleFontFamily = () => {
+    const cycleFontFamily = useCallback(() => {
         setFontFamilyState(prev => {
             let next: FontFamily = 'serif';
             if (prev === 'serif') next = 'sans';
@@ -220,50 +302,36 @@ export const ReaderProvider: React.FC<{ children: React.ReactNode }> = ({ childr
             AsyncStorage.setItem('reader-font-family', next);
             return next;
         });
-    };
+    }, []);
+
+    const activeBook = useMemo(() => libraryBooks.find(b => b.id === activeBookId) || null, [activeBookId]);
+
+    const settingsValue = useMemo<ReaderSettingsContextType>(() => ({
+        theme, setTheme, fontSize, increaseFontSize, decreaseFontSize, resetFontSize, fontFamily, cycleFontFamily,
+    }), [theme, setTheme, fontSize, increaseFontSize, decreaseFontSize, resetFontSize, fontFamily, cycleFontFamily]);
+
+    const navValue = useMemo<ReaderNavContextType>(() => ({
+        isReady, activeChapterId, setActiveChapterId, activeBookId, setActiveBookId, activeBook, books: libraryBooks,
+    }), [isReady, activeChapterId, setActiveChapterId, activeBookId, setActiveBookId, activeBook]);
+
+    const uiValue = useMemo<ReaderUIContextType>(() => ({
+        isSearchOpen, setSearchOpen, isSadhanaOpen, setSadhanaOpen, sadhanaActiveTab, setSadhanaActiveTab,
+        isDrawerOpen, setDrawerOpen, isChapterIndexOpen, setChapterIndexOpen, isTourActive, setTourActive, tourStep, setTourStep,
+    }), [isSearchOpen, isSadhanaOpen, sadhanaActiveTab, isDrawerOpen, isChapterIndexOpen, isTourActive, setTourActive, tourStep]);
+
+    const sadhanaValue = useMemo<SadhanaContextType>(() => ({
+        sadhanaStreak, sadhanaTodayJap, recordSadhanaJap,
+    }), [sadhanaStreak, sadhanaTodayJap, recordSadhanaJap]);
 
     return (
-        <ReaderContext.Provider value={{
-            isReady,
-            theme,
-            setTheme,
-            fontSize,
-            increaseFontSize,
-            decreaseFontSize,
-            resetFontSize,
-            fontFamily,
-            cycleFontFamily,
-            activeChapterId,
-            setActiveChapterId,
-            activeBookId,
-            setActiveBookId,
-            activeBook,
-            books: libraryBooks,
-            isSearchOpen,
-            setSearchOpen,
-            isSadhanaOpen,
-            setSadhanaOpen,
-            isDrawerOpen,
-            setDrawerOpen,
-            isChapterIndexOpen,
-            setChapterIndexOpen,
-            isTourActive,
-            setTourActive,
-            tourStep,
-            setTourStep,
-            sadhanaStreak,
-            sadhanaTodayJap,
-            recordSadhanaJap
-        }}>
-            {children}
-        </ReaderContext.Provider>
+        <ReaderSettingsContext.Provider value={settingsValue}>
+            <ReaderNavContext.Provider value={navValue}>
+                <ReaderUIContext.Provider value={uiValue}>
+                    <SadhanaContext.Provider value={sadhanaValue}>
+                        {children}
+                    </SadhanaContext.Provider>
+                </ReaderUIContext.Provider>
+            </ReaderNavContext.Provider>
+        </ReaderSettingsContext.Provider>
     );
-};
-
-export const useReader = () => {
-    const context = useContext(ReaderContext);
-    if (context === undefined) {
-        throw new Error('useReader must be used within a ReaderProvider');
-    }
-    return context;
 };

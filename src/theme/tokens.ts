@@ -59,3 +59,17 @@ export const themeGradient: Record<Theme, [string, string]> = {
     dark: ['#14110f', '#0d0a08'],
     papyrus: ['#f3e9c8', '#ebdcb9'],
 };
+
+/** Plain hex values for spots that need a real color (native style props like
+ * SVG fills or Pagination dotStyle) rather than a NativeWind className. */
+export const themePrimaryHex: Record<Theme, string> = {
+    light: '#8c1d18',
+    dark: '#ffb4ab',
+    papyrus: '#765a00',
+};
+
+export const themeInkHex: Record<Theme, string> = {
+    light: '#2c2520',
+    dark: '#e5dec9',
+    papyrus: '#4a3b2a',
+};
